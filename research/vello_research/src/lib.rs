@@ -449,7 +449,7 @@ pub struct BumpPoll {
 }
 
 /// Grows each size in `sizes` that `bump`, read back after a render, shows too small: to the
-/// next power of two at or above twice the need, at most 16 times the fixed size of
+/// next power of two at or above the need plus one eighth, at most 16 times the fixed size of
 /// [`BufferSizes::new`](vello_encoding::BufferSizes::new) and what the device can bind in
 /// `max_binding` bytes. Never shrinks. Returns whether any size grew.
 #[cfg(feature = "wgpu")]
@@ -483,7 +483,8 @@ fn grow_bump_sizes(sizes: &mut BumpAllocators, bump: &BumpAllocators, max_bindin
             continue;
         }
         let max = (16 * fixed).min(bindable);
-        let new = (2 * u64::from(need)).next_power_of_two().min(max) as u32;
+        let need = u64::from(need);
+        let new = (need + need / 8).next_power_of_two().min(max) as u32;
         if new > *size {
             *size = new;
             grown = true;
@@ -967,15 +968,19 @@ mod tests {
     use super::{BumpAllocators, Renderer, grow_bump_sizes};
 
     #[test]
-    fn bump_sizes_grow_to_twice_the_need_up_to_what_binds() {
+    fn bump_sizes_grow_to_an_eighth_above_the_need_up_to_what_binds() {
         const BINDING: u64 = 128 << 20;
         let mut sizes = Renderer::SMALL_BUMP_SIZES;
+        // Just above a power of two: 65,537 and an eighth fit in the next one.
+        // Just below a power of two: 262,143 and an eighth do not fit in 1 << 18.
         let need = BumpAllocators {
             lines: (1 << 16) + 1,
+            tile: (1 << 18) - 1,
             ..Default::default()
         };
         assert!(grow_bump_sizes(&mut sizes, &need, BINDING));
-        assert_eq!(sizes.lines, 1 << 18);
+        assert_eq!(sizes.lines, 1 << 17);
+        assert_eq!(sizes.tile, 1 << 19);
         assert_eq!(sizes.ptcl, Renderer::SMALL_BUMP_SIZES.ptcl);
         assert!(!grow_bump_sizes(&mut sizes, &need, BINDING));
         // 24-byte lines: 5,592,405 fit in 128 MiB, below 16 times the fixed 1 << 21.
