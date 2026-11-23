@@ -149,18 +149,21 @@ pub use vello_encoding::{FontEmbolden, Glyph, NormalizedCoord};
 
 use low_level::ShaderId;
 #[cfg(feature = "wgpu")]
-use low_level::{FullShaders, Recording, Render};
+use low_level::{BufferProxy, FullShaders, Recording, Render};
 use thiserror::Error;
 
 #[cfg(feature = "wgpu")]
 use debug::DebugLayers;
 #[cfg(feature = "wgpu")]
-use vello_encoding::{BumpAllocators, Resolver};
+use vello_encoding::{BumpAllocators, LineSoup, PathSegment, Resolver, SegmentCount, Tile};
 #[cfg(feature = "wgpu")]
 use wgpu_engine::{ExternalResource, WgpuEngine};
 
 #[cfg(feature = "wgpu")]
-use std::{num::NonZeroUsize, sync::atomic::AtomicBool};
+use std::{
+    num::NonZeroUsize,
+    sync::{Arc, OnceLock, atomic::AtomicBool},
+};
 #[cfg(feature = "wgpu")]
 use wgpu::{Device, Queue, TextureView};
 #[cfg(all(feature = "wgpu", feature = "wgpu-profiler"))]
@@ -334,6 +337,12 @@ pub struct Renderer {
     resolver: Resolver,
     image_atlas: Option<recording::ImageProxy>,
     shaders: FullShaders,
+    /// The sizes of the bump-allocated buffers while they grow on demand; see
+    /// [`Renderer::set_bump_sizes`].
+    bump_sizes: Option<BumpAllocators>,
+    /// Downloads of bump allocators not read yet, each with the outcome of its mapping once the
+    /// GPU has answered.
+    bump_reads: Vec<(BufferProxy, Arc<OnceLock<bool>>)>,
     #[cfg(feature = "debug_layers")]
     debug: debug::DebugRenderer,
     #[cfg(feature = "wgpu-profiler")]
@@ -428,6 +437,65 @@ struct RenderResult {
     captured: Option<render::CapturedBuffers>,
 }
 
+/// What [`Renderer::poll_bump`] found.
+#[cfg(feature = "wgpu")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BumpPoll {
+    /// The bump allocators of a render have not been answered yet: poll again soon.
+    pub pending: bool,
+    /// The buffers grew: every render made before this poll may have lost its content and
+    /// should be made again.
+    pub grown: bool,
+}
+
+/// Grows each size in `sizes` that `bump`, read back after a render, shows too small: to the
+/// next power of two at or above twice the need, at most 16 times the fixed size of
+/// [`BufferSizes::new`](vello_encoding::BufferSizes::new) and what the device can bind in
+/// `max_binding` bytes. Never shrinks. Returns whether any size grew.
+#[cfg(feature = "wgpu")]
+fn grow_bump_sizes(sizes: &mut BumpAllocators, bump: &BumpAllocators, max_binding: u64) -> bool {
+    static HAS_WARNED: AtomicBool = AtomicBool::new(false);
+    let words = max_binding / size_of::<u32>() as u64;
+    // `bin_data` and `ptcl` hold a part of their own before the dynamic one: they get half the
+    // binding to leave room for it.
+    let fields: [(&mut u32, u32, u64, u64); 7] = [
+        (&mut sizes.lines, bump.lines, 1 << 21, max_binding / size_of::<LineSoup>() as u64),
+        (&mut sizes.binning, bump.binning, 1 << 18, words / 2),
+        (&mut sizes.tile, bump.tile, 1 << 21, max_binding / size_of::<Tile>() as u64),
+        (
+            &mut sizes.seg_counts,
+            bump.seg_counts,
+            1 << 21,
+            max_binding / size_of::<SegmentCount>() as u64,
+        ),
+        (
+            &mut sizes.segments,
+            bump.segments,
+            1 << 21,
+            max_binding / size_of::<PathSegment>() as u64,
+        ),
+        (&mut sizes.blend, bump.blend, 1 << 20, words),
+        (&mut sizes.ptcl, bump.ptcl, 1 << 23, words / 2),
+    ];
+    let mut grown = false;
+    for (size, need, fixed, bindable) in fields {
+        if need <= *size {
+            continue;
+        }
+        let max = (16 * fixed).min(bindable);
+        let new = (2 * u64::from(need)).next_power_of_two().min(max) as u32;
+        if new > *size {
+            *size = new;
+            grown = true;
+        } else if !HAS_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            log::warn!(
+                "A scene needs more than the largest bump-allocated buffer Vello allows ({need} > {size}); it is not drawn"
+            );
+        }
+    }
+    grown
+}
+
 #[cfg(feature = "wgpu")]
 impl Renderer {
     /// Creates a new renderer for the specified device.
@@ -456,6 +524,8 @@ impl Renderer {
             profiler: GpuProfiler::new(device, GpuProfilerSettings::default())?,
             #[cfg(feature = "wgpu-profiler")]
             profile_result: None,
+            bump_sizes: None,
+            bump_reads: Vec::new(),
         })
     }
 
@@ -481,12 +551,14 @@ impl Renderer {
         texture: &TextureView,
         params: &RenderParams,
     ) -> Result<()> {
-        let (recording, target) = render::render_full(
+        let bump_sizes = self.bump_sizes.filter(|_| !self.engine.use_cpu);
+        let (recording, target, bump_buf) = render::render_full(
             scene,
             &mut self.resolver,
             &self.shaders,
             &mut self.image_atlas,
             params,
+            bump_sizes,
         );
         let external_resources = [ExternalResource::Image(
             *target.as_image().unwrap(),
@@ -501,6 +573,16 @@ impl Renderer {
             #[cfg(feature = "wgpu-profiler")]
             &mut self.profiler,
         )?;
+        if let Some(bump_buf) = bump_buf
+            && let Some(buf) = self.engine.get_download(bump_buf)
+        {
+            let mapped = Arc::new(OnceLock::new());
+            let answer = mapped.clone();
+            buf.slice(..).map_async(wgpu::MapMode::Read, move |result| {
+                let _ = answer.set(result.is_ok());
+            });
+            self.bump_reads.push((bump_buf, mapped));
+        }
         // N.B. This is horrible; this integration of wgpu-profiler really needs some work...
         #[cfg(feature = "wgpu-profiler")]
         {
@@ -514,6 +596,76 @@ impl Renderer {
         }
 
         Ok(())
+    }
+
+    /// Starting sizes for [`set_bump_sizes`](Self::set_bump_sizes): about 8 MB for the seven
+    /// buffers, plus 64 words per tile of the target in `ptcl` and the draw info in `bin_data`.
+    /// The fixed sizes take about 165 MB.
+    pub const SMALL_BUMP_SIZES: BumpAllocators = BumpAllocators {
+        failed: 0,
+        binning: 1 << 16,
+        ptcl: 1 << 18,
+        tile: 1 << 17,
+        seg_counts: 1 << 17,
+        segments: 1 << 17,
+        blend: 1 << 16,
+        lines: 1 << 16,
+    };
+
+    /// Sizes the seven bump-allocated work buffers (lines, binning, tiles, segment counts,
+    /// segments, blend spill, per-tile command lists) from `sizes` and lets them grow; `None`,
+    /// the default, keeps the fixed sizes, which are large and never grow.
+    ///
+    /// `sizes` are in the units of the GPU's counters, as `RenderConfig::set_bump_sizes` says.
+    /// While they are set, each [`render_to_texture`](Self::render_to_texture) also downloads
+    /// the bump allocators, without waiting; [`poll_bump`](Self::poll_bump) reads them and grows
+    /// the buffers a render overflowed. A render that overflowed draws nothing and must be made
+    /// again. No effect with [`RendererOptions::use_cpu`].
+    pub fn set_bump_sizes(&mut self, sizes: Option<BumpAllocators>) {
+        self.bump_sizes = sizes;
+        self.engine.clear_pool();
+    }
+
+    /// Reads, without waiting, the bump allocators of the renders the GPU has finished, and
+    /// grows the buffers they show too small (see [`set_bump_sizes`](Self::set_bump_sizes)).
+    /// A stage that overflows skips the later stages, which then report no need, so a scene may
+    /// take a few rounds to fit. The pool of free buffers is emptied when the sizes grow.
+    pub fn poll_bump(&mut self, device: &Device) -> BumpPoll {
+        let mut poll = BumpPoll::default();
+        if self.bump_reads.is_empty() {
+            return poll;
+        }
+        // Runs the callbacks of the mappings that are done; never blocks.
+        let _ = device.poll(wgpu::PollType::Poll);
+        let max_binding = device.limits().max_storage_buffer_binding_size;
+        self.bump_reads.retain(|(proxy, mapped)| {
+            let Some(&ok) = mapped.get() else {
+                poll.pending = true;
+                return true;
+            };
+            let bump = self
+                .engine
+                .get_download(*proxy)
+                .filter(|_| ok)
+                .and_then(|buf| {
+                    let bump = buf
+                        .slice(..)
+                        .get_mapped_range()
+                        .ok()
+                        .map(|view| bytemuck::pod_read_unaligned::<BumpAllocators>(&view));
+                    buf.unmap();
+                    bump
+                });
+            self.engine.free_download(*proxy);
+            if let (Some(bump), Some(sizes)) = (bump, &mut self.bump_sizes) {
+                poll.grown |= grow_bump_sizes(sizes, &bump, max_binding);
+            }
+            false
+        });
+        if poll.grown {
+            self.engine.clear_pool();
+        }
+        poll
     }
 
     /// Overwrite `image` with `texture`.
@@ -807,5 +959,32 @@ impl<'a> DebugDownloads<'a> {
         lines.map_async(wgpu::MapMode::Read, move |v| sender.send(v).unwrap());
         receiver.receive().await.expect("channel was closed")?;
         Ok(Self { lines })
+    }
+}
+
+#[cfg(all(test, feature = "wgpu"))]
+mod tests {
+    use super::{BumpAllocators, Renderer, grow_bump_sizes};
+
+    #[test]
+    fn bump_sizes_grow_to_twice_the_need_up_to_what_binds() {
+        const BINDING: u64 = 128 << 20;
+        let mut sizes = Renderer::SMALL_BUMP_SIZES;
+        let need = BumpAllocators {
+            lines: (1 << 16) + 1,
+            ..Default::default()
+        };
+        assert!(grow_bump_sizes(&mut sizes, &need, BINDING));
+        assert_eq!(sizes.lines, 1 << 18);
+        assert_eq!(sizes.ptcl, Renderer::SMALL_BUMP_SIZES.ptcl);
+        assert!(!grow_bump_sizes(&mut sizes, &need, BINDING));
+        // 24-byte lines: 5,592,405 fit in 128 MiB, below 16 times the fixed 1 << 21.
+        let huge = BumpAllocators {
+            lines: u32::MAX / 2,
+            ..Default::default()
+        };
+        assert!(grow_bump_sizes(&mut sizes, &huge, BINDING));
+        assert_eq!(sizes.lines, (BINDING / 24) as u32);
+        assert!(!grow_bump_sizes(&mut sizes, &huge, BINDING));
     }
 }

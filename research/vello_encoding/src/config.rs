@@ -11,6 +11,9 @@ use bytemuck::{Pod, Zeroable};
 
 const TILE_WIDTH: u32 = 16;
 const TILE_HEIGHT: u32 = 16;
+/// Words of the per-tile command list each tile starts with; must match `PTCL_INITIAL_ALLOC` in
+/// `shader/shared/ptcl.wgsl`.
+const PTCL_INITIAL_ALLOC: u32 = 64;
 
 // TODO: Obtain these from the vello_shaders crate
 pub(crate) const PATH_REDUCE_WG: u32 = 256;
@@ -193,6 +196,35 @@ impl RenderConfig {
             workgroup_counts,
             buffer_sizes,
         }
+    }
+
+    /// Sizes the seven bump-allocated buffers from `sizes` instead of the fixed sizes of
+    /// [`BufferSizes::new`], so that a caller can start small and grow.
+    ///
+    /// Each field is in the units of the GPU counter of the same name, so the
+    /// [`BumpAllocators`] read back after a render tells what a render needed; `failed` is
+    /// ignored. `binning` and `ptcl` count only the dynamic part of their buffer: the draw info
+    /// that precedes the binning output (`layout.bin_data_start` words) and the command list
+    /// that every tile starts with (`PTCL_INITIAL_ALLOC` words per tile) are added here, for this
+    /// scene and this target.
+    pub fn set_bump_sizes(&mut self, sizes: &BumpAllocators) {
+        let bin_data_start = self.gpu.layout.bin_data_start;
+        let ptcl_start = self.gpu.width_in_tiles * self.gpu.height_in_tiles * PTCL_INITIAL_ALLOC;
+        let buffers = &mut self.buffer_sizes;
+        buffers.lines = BufferSize::new(sizes.lines);
+        buffers.bin_data = BufferSize::new(bin_data_start + sizes.binning);
+        buffers.tiles = BufferSize::new(sizes.tile);
+        buffers.seg_counts = BufferSize::new(sizes.seg_counts);
+        buffers.segments = BufferSize::new(sizes.segments);
+        buffers.blend_spill = BufferSize::new(sizes.blend);
+        buffers.ptcl = BufferSize::new(ptcl_start + sizes.ptcl);
+        self.gpu.lines_size = buffers.lines.len();
+        self.gpu.binning_size = buffers.bin_data.len() - bin_data_start;
+        self.gpu.tiles_size = buffers.tiles.len();
+        self.gpu.seg_counts_size = buffers.seg_counts.len();
+        self.gpu.segments_size = buffers.segments.len();
+        self.gpu.blend_size = buffers.blend_spill.len();
+        self.gpu.ptcl_size = buffers.ptcl.len();
     }
 }
 

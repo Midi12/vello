@@ -10,7 +10,9 @@ use crate::{AaConfig, RenderParams};
 #[cfg(feature = "wgpu")]
 use crate::Scene;
 
-use vello_encoding::{Encoding, Resolver, WorkgroupSize, make_mask_lut, make_mask_lut_16};
+use vello_encoding::{
+    BumpAllocators, Encoding, Resolver, WorkgroupSize, make_mask_lut, make_mask_lut_16,
+};
 
 #[derive(Clone, Copy, Debug)]
 enum AtlasProxyAction {
@@ -24,6 +26,9 @@ pub struct Render {
     fine_wg_count: Option<WorkgroupSize>,
     fine_resources: Option<FineResources>,
     mask_buf: Option<ResourceProxy>,
+    /// Sizes of the bump-allocated buffers, in place of the fixed ones; see
+    /// `RenderConfig::set_bump_sizes`.
+    bump_sizes: Option<BumpAllocators>,
 
     #[cfg(feature = "debug_layers")]
     captured_buffers: Option<CapturedBuffers>,
@@ -87,8 +92,9 @@ pub(crate) fn render_full(
     shaders: &FullShaders,
     image_atlas: &mut Option<ImageProxy>,
     params: &RenderParams,
-) -> (Recording, ResourceProxy) {
-    render_encoding_full(scene.encoding(), resolver, shaders, image_atlas, params)
+    bump_sizes: Option<BumpAllocators>,
+) -> (Recording, ResourceProxy, Option<BufferProxy>) {
+    render_encoding_full(scene.encoding(), resolver, shaders, image_atlas, params, bump_sizes)
 }
 
 #[cfg(feature = "wgpu")]
@@ -96,19 +102,29 @@ pub(crate) fn render_full(
 ///
 /// This function is not recommended when the scene can be complex, as it does not
 /// implement robust dynamic memory.
+///
+/// With `bump_sizes`, the bump-allocated buffers take those sizes and the bump allocators are
+/// downloaded: the third value is that download.
 pub(crate) fn render_encoding_full(
     encoding: &Encoding,
     resolver: &mut Resolver,
     shaders: &FullShaders,
     image_atlas: &mut Option<ImageProxy>,
     params: &RenderParams,
-) -> (Recording, ResourceProxy) {
+    bump_sizes: Option<BumpAllocators>,
+) -> (Recording, ResourceProxy, Option<BufferProxy>) {
     let mut render = Render::new();
+    render.bump_sizes = bump_sizes;
     let mut recording =
         render.render_encoding_coarse(encoding, resolver, shaders, image_atlas, params, false);
     let out_image = render.out_image();
+    let bump_buf = bump_sizes.map(|_| {
+        let bump_buf = render.bump_buf();
+        recording.download(bump_buf);
+        bump_buf
+    });
     render.record_fine(shaders, &mut recording);
-    (recording, out_image.into())
+    (recording, out_image.into(), bump_buf)
 }
 
 impl Default for Render {
@@ -123,6 +139,7 @@ impl Render {
             fine_wg_count: None,
             fine_resources: None,
             mask_buf: None,
+            bump_sizes: None,
             #[cfg(feature = "debug_layers")]
             captured_buffers: None,
         }
@@ -201,8 +218,11 @@ impl Render {
         for image in images.images {
             recording.write_image(image_atlas, image.1, image.2, image.0.clone());
         }
-        let cpu_config =
+        let mut cpu_config =
             RenderConfig::new(&layout, params.width, params.height, &params.base_color);
+        if let Some(sizes) = &self.bump_sizes {
+            cpu_config.set_bump_sizes(sizes);
+        }
         // HACK: The coarse workgroup counts is the number of active bins.
         if (cpu_config.workgroup_counts.coarse.0
             * cpu_config.workgroup_counts.coarse.1

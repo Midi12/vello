@@ -784,6 +784,12 @@ impl WgpuEngine {
         self.downloads.remove(&buf.id);
     }
 
+    /// Drops every pooled buffer, for instance after the bump sizes grew, so that the smaller
+    /// buffers they replace are not kept.
+    pub fn clear_pool(&mut self) {
+        self.pool.bufs.clear();
+    }
+
     fn create_bind_group_layout_entries(
         layout: impl Iterator<Item = (BindType, wgpu::ShaderStages)>,
     ) -> Vec<wgpu::BindGroupLayoutEntry> {
