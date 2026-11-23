@@ -631,13 +631,21 @@ impl Renderer {
     /// grows the buffers they show too small (see [`set_bump_sizes`](Self::set_bump_sizes)).
     /// A stage that overflows skips the later stages, which then report no need, so a scene may
     /// take a few rounds to fit. The pool of free buffers is emptied when the sizes grow.
+    ///
+    /// If the device cannot be polled, no answer will come: every outstanding download is
+    /// dropped and nothing is reported pending.
     pub fn poll_bump(&mut self, device: &Device) -> BumpPoll {
         let mut poll = BumpPoll::default();
         if self.bump_reads.is_empty() {
             return poll;
         }
         // Runs the callbacks of the mappings that are done; never blocks.
-        let _ = device.poll(wgpu::PollType::Poll);
+        if device.poll(wgpu::PollType::Poll).is_err() {
+            for (proxy, _) in std::mem::take(&mut self.bump_reads) {
+                self.engine.free_download(proxy);
+            }
+            return BumpPoll::default();
+        }
         let max_binding = device.limits().max_storage_buffer_binding_size;
         self.bump_reads.retain(|(proxy, mapped)| {
             let Some(&ok) = mapped.get() else {
